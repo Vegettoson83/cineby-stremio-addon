@@ -1,14 +1,48 @@
-{
-  "name": "cineby-stremio-addon",
-  "version": "1.0.0",
-  "description": "Cineby Stremio Addon",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "axios": "^1.7.0",
-    "cors": "^2.8.5",
-    "express": "^4.18.2"
-  }
-}
+: 'org.cineby.addon',
+    version: '1.0.0',
+    name: 'Cineby Addon',
+    description: 'Access Cineby movies and TV shows through Stremio',
+    logo: 'https://www.cineby.app/icon-192x192.png',
+    resources: ['catalog', 'meta', 'stream'],
+    types: ['movie', 'series'],
+    catalogs: [
+        {
+            type: 'movie',
+            id: 'cineby-trending-movies',
+            name: 'Cineby Trending Movies',
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
+        },
+        {
+            type: 'series',
+            id: 'cineby-trending-series',
+            name: 'Cineby Trending TV Shows', 
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
+        },
+        {
+            type: 'movie',
+            id: 'cineby-movies',
+            name: 'Cineby Movies',
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false },
+                { name: 'genre', isRequired: false }
+            ]
+        },
+        {
+            type: 'series', 
+            id: 'cineby-series',
+            name: 'Cineby Series',
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false },
+                { name: 'genre', isRequired: false }
+            ]
+        }
+    ],
+    idPrefixes: ['cineby:']
