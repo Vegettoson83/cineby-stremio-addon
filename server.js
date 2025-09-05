@@ -3,13 +3,27 @@ const cors = require('cors');
 const axios = require('axios');
 const app = express();
 
-app.use(cors());
+// Middleware
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
+
+// Rate limiting for production
+const rateLimit = require('express-rate-limit');
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 1000, // limit each IP to 1000 requests per windowMs
+    message: 'Too many requests from this IP'
+});
+app.use(limiter);
 
 // Addon manifest
 const manifest = {
     id: 'org.cineby.addon',
-    version: '1.0.0',
+    version: '1.0.1',
     name: 'Cineby Addon',
     description: 'Access Cineby movies and TV shows through Stremio',
     logo: 'https://www.cineby.app/icon-192x192.png',
@@ -55,165 +69,178 @@ const manifest = {
             ]
         }
     ],
-    idPrefixes: ['cineby:']
+    idPrefixes: ['cineby:'],
+    behaviorHints: {
+        configurable: false,
+        configurationRequired: false
+    }
 };
 
-// Cineby API client
+// Cineby API client with improved error handling and caching
 class CinebyClient {
     constructor() {
         this.baseURL = 'https://www.cineby.app';
-        this.buildId = '7xu4PEyycasyUF-xW91f5'; // Will need to be dynamically fetched
+        this.buildId = '7xu4PEyycasyUF-xW91f5'; // Fallback build ID
+        this.buildIdCache = null;
+        this.buildIdCacheTime = null;
         this.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.cineby.app/'
+            'Referer': 'https://www.cineby.app/',
+            'Cache-Control': 'no-cache'
+        };
+        
+        // Initialize axios with timeout and retry logic
+        this.axiosConfig = {
+            timeout: 10000,
+            headers: this.headers,
+            validateStatus: (status) => status < 500 // Don't throw on 4xx errors
         };
     }
 
     async getBuildId() {
         try {
-            // Get the build ID from the main page
-            const response = await axios.get(`${this.baseURL}/`, { headers: this.headers });
-            const buildIdMatch = response.data.match(/"buildId":"([^"]+)"/);
-            if (buildIdMatch) {
-                this.buildId = buildIdMatch[1];
+            // Cache build ID for 1 hour
+            const now = Date.now();
+            if (this.buildIdCache && this.buildIdCacheTime && (now - this.buildIdCacheTime < 3600000)) {
+                this.buildId = this.buildIdCache;
+                return;
+            }
+
+            const response = await axios.get(`${this.baseURL}/`, this.axiosConfig);
+            if (response.status === 200) {
+                const buildIdMatch = response.data.match(/"buildId":"([^"]+)"/);
+                if (buildIdMatch) {
+                    this.buildId = buildIdMatch[1];
+                    this.buildIdCache = this.buildId;
+                    this.buildIdCacheTime = now;
+                    console.log('Updated build ID:', this.buildId);
+                }
             }
         } catch (error) {
-            console.warn('Could not fetch build ID, using default');
+            console.warn('Could not fetch build ID, using cached/default:', error.message);
+        }
+    }
+
+    async makeRequest(url, params = {}) {
+        try {
+            const response = await axios.get(url, {
+                ...this.axiosConfig,
+                params
+            });
+            
+            if (response.status === 200) {
+                return response.data;
+            } else {
+                console.warn(`Request failed with status ${response.status}:`, url);
+                return null;
+            }
+        } catch (error) {
+            if (error.code === 'ECONNABORTED') {
+                console.error('Request timeout:', url);
+            } else {
+                console.error('Request failed:', error.message);
+            }
+            return null;
         }
     }
 
     async getTrending() {
-        try {
-            const url = `${this.baseURL}/_next/data/${this.buildId}/en.json`;
-            const response = await axios.get(url, { headers: this.headers });
-            
-            if (response.data?.pageProps?.trending) {
-                return response.data.pageProps.trending;
-            }
-            return [];
-        } catch (error) {
-            console.error('Failed to get trending:', error.message);
-            return [];
+        await this.getBuildId();
+        const url = `${this.baseURL}/_next/data/${this.buildId}/en.json`;
+        const data = await this.makeRequest(url);
+        
+        if (data?.pageProps?.trending) {
+            return data.pageProps.trending;
         }
+        return [];
     }
 
     async search(query, page = 1) {
-        try {
-            const url = `${this.baseURL}/_next/data/${this.buildId}/en/search.json`;
-            const response = await axios.get(url, { 
-                headers: this.headers,
-                params: { q: query, page: page }
-            });
-            
-            if (response.data?.pageProps?.results) {
-                return response.data.pageProps.results;
-            }
-            return [];
-        } catch (error) {
-            console.error('Search failed:', error.message);
-            return [];
+        if (!query || query.trim().length === 0) return [];
+        
+        await this.getBuildId();
+        const url = `${this.baseURL}/_next/data/${this.buildId}/en/search.json`;
+        const data = await this.makeRequest(url, { q: query.trim(), page });
+        
+        if (data?.pageProps?.results) {
+            return data.pageProps.results;
         }
+        return [];
     }
 
     async getMovies(page = 1, genre = null) {
-        try {
-            let url = `${this.baseURL}/_next/data/${this.buildId}/en/movie.json`;
-            const params = { page };
-            if (genre) params.genre = genre;
-            
-            const response = await axios.get(url, { 
-                headers: this.headers,
-                params: params
-            });
-            
-            if (response.data?.pageProps?.movies) {
-                return response.data.pageProps.movies;
-            }
-            return [];
-        } catch (error) {
-            console.error('Failed to get movies:', error.message);
-            return [];
+        await this.getBuildId();
+        const url = `${this.baseURL}/_next/data/${this.buildId}/en/movie.json`;
+        const params = { page };
+        if (genre) params.genre = genre;
+        
+        const data = await this.makeRequest(url, params);
+        
+        if (data?.pageProps?.movies) {
+            return data.pageProps.movies;
         }
+        return [];
     }
 
     async getTVShows(page = 1, genre = null) {
-        try {
-            let url = `${this.baseURL}/_next/data/${this.buildId}/en/tv.json`;
-            const params = { page };
-            if (genre) params.genre = genre;
-            
-            const response = await axios.get(url, { 
-                headers: this.headers,
-                params: params
-            });
-            
-            if (response.data?.pageProps?.shows) {
-                return response.data.pageProps.shows;
-            }
-            return [];
-        } catch (error) {
-            console.error('Failed to get TV shows:', error.message);
-            return [];
+        await this.getBuildId();
+        const url = `${this.baseURL}/_next/data/${this.buildId}/en/tv.json`;
+        const params = { page };
+        if (genre) params.genre = genre;
+        
+        const data = await this.makeRequest(url, params);
+        
+        if (data?.pageProps?.shows) {
+            return data.pageProps.shows;
         }
+        return [];
     }
 
     async getContentDetails(id, mediaType) {
-        try {
-            let endpoint;
-            if (mediaType === 'movie') {
-                endpoint = `${this.baseURL}/_next/data/${this.buildId}/en/movie/${id}.json`;
-            } else {
-                endpoint = `${this.baseURL}/_next/data/${this.buildId}/en/tv/${id}.json`;
-            }
-            
-            const response = await axios.get(endpoint, { headers: this.headers });
-            
-            if (response.data?.pageProps) {
-                return response.data.pageProps;
-            }
-            return null;
-        } catch (error) {
-            console.error('Failed to get content details:', error.message);
-            return null;
+        await this.getBuildId();
+        let endpoint;
+        if (mediaType === 'movie') {
+            endpoint = `${this.baseURL}/_next/data/${this.buildId}/en/movie/${id}.json`;
+        } else {
+            endpoint = `${this.baseURL}/_next/data/${this.buildId}/en/tv/${id}.json`;
         }
+        
+        const data = await this.makeRequest(endpoint);
+        return data?.pageProps || null;
     }
 
     async getStreamSources(id, mediaType, season = null, episode = null) {
-        try {
-            let endpoint;
-            if (mediaType === 'movie') {
-                endpoint = `${this.baseURL}/api/v2/movie/${id}`;
-            } else {
-                endpoint = `${this.baseURL}/api/v2/tv/${id}`;
-                if (season && episode) {
-                    endpoint += `/${season}/${episode}`;
-                }
+        let endpoint;
+        if (mediaType === 'movie') {
+            endpoint = `${this.baseURL}/api/v2/movie/${id}`;
+        } else {
+            endpoint = `${this.baseURL}/api/v2/tv/${id}`;
+            if (season && episode) {
+                endpoint += `/${season}/${episode}`;
             }
-            
-            const response = await axios.get(endpoint, { headers: this.headers });
-            return response.data;
-        } catch (error) {
-            console.error('Failed to get stream sources:', error.message);
-            return null;
         }
+        
+        return await this.makeRequest(endpoint);
     }
 
     transformToStremioMeta(item) {
+        if (!item || !item.id) return null;
+        
         const isMovie = item.mediaType === 'movie';
         
         return {
             id: `cineby:${item.id}`,
             type: isMovie ? 'movie' : 'series',
-            name: item.title,
-            poster: item.poster,
-            background: item.image,
-            description: item.description,
-            releaseInfo: item.release_date,
+            name: item.title || item.name || 'Unknown Title',
+            poster: item.poster || item.poster_path,
+            background: item.image || item.backdrop_path,
+            description: item.description || item.overview || '',
+            releaseInfo: item.release_date || item.first_air_date || '',
             imdbRating: item.rating ? item.rating.toString() : null,
             genres: this.mapGenreIds(item.genre_ids || []),
-            language: item.original_language
+            language: item.original_language || 'en'
         };
     }
 
@@ -237,9 +264,18 @@ class CinebyClient {
 const client = new CinebyClient();
 
 // Initialize build ID on startup
-client.getBuildId();
+client.getBuildId().catch(console.error);
 
 // Routes
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Cineby Stremio Addon',
+        version: manifest.version,
+        description: manifest.description,
+        manifest: '/manifest.json'
+    });
+});
+
 app.get('/manifest.json', (req, res) => {
     res.json(manifest);
 });
@@ -247,15 +283,25 @@ app.get('/manifest.json', (req, res) => {
 app.get('/catalog/:type/:id/:extra?', async (req, res) => {
     try {
         const { type, id, extra } = req.params;
+        
+        // Validate type
+        if (!['movie', 'series'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid type' });
+        }
+        
         let results = [];
         
         // Parse extra parameters
         let search, skip = 0, genre;
         if (extra) {
-            const params = new URLSearchParams(extra);
-            search = params.get('search');
-            skip = parseInt(params.get('skip')) || 0;
-            genre = params.get('genre');
+            try {
+                const params = new URLSearchParams(extra);
+                search = params.get('search');
+                skip = Math.max(0, parseInt(params.get('skip')) || 0);
+                genre = params.get('genre');
+            } catch (e) {
+                console.warn('Failed to parse extra params:', e.message);
+            }
         }
         
         const page = Math.floor(skip / 20) + 1;
@@ -264,8 +310,9 @@ app.get('/catalog/:type/:id/:extra?', async (req, res) => {
             // Search functionality
             const searchResults = await client.search(search, page);
             results = searchResults
-                .filter(item => item.mediaType === (type === 'series' ? 'tv' : 'movie'))
-                .map(item => client.transformToStremioMeta(item));
+                .filter(item => item && item.mediaType === (type === 'series' ? 'tv' : 'movie'))
+                .map(item => client.transformToStremioMeta(item))
+                .filter(Boolean);
         } else {
             // Different catalog types
             switch (id) {
@@ -273,38 +320,56 @@ app.get('/catalog/:type/:id/:extra?', async (req, res) => {
                 case 'cineby-trending-series':
                     const trending = await client.getTrending();
                     results = trending
-                        .filter(item => item.mediaType === (type === 'series' ? 'tv' : 'movie'))
+                        .filter(item => item && item.mediaType === (type === 'series' ? 'tv' : 'movie'))
                         .slice(skip, skip + 20)
-                        .map(item => client.transformToStremioMeta(item));
+                        .map(item => client.transformToStremioMeta(item))
+                        .filter(Boolean);
                     break;
                     
                 case 'cineby-movies':
-                    const movies = await client.getMovies(page, genre);
-                    results = movies.map(item => client.transformToStremioMeta({...item, mediaType: 'movie'}));
+                    if (type === 'movie') {
+                        const movies = await client.getMovies(page, genre);
+                        results = movies
+                            .map(item => client.transformToStremioMeta({...item, mediaType: 'movie'}))
+                            .filter(Boolean);
+                    }
                     break;
                     
                 case 'cineby-series':
-                    const tvShows = await client.getTVShows(page, genre);
-                    results = tvShows.map(item => client.transformToStremioMeta({...item, mediaType: 'tv'}));
+                    if (type === 'series') {
+                        const tvShows = await client.getTVShows(page, genre);
+                        results = tvShows
+                            .map(item => client.transformToStremioMeta({...item, mediaType: 'tv'}))
+                            .filter(Boolean);
+                    }
                     break;
                     
-                case 'cineby-anime':
-                    const anime = await client.getAnime(page);
-                    results = anime.map(item => client.transformToStremioMeta({...item, mediaType: 'tv'}));
-                    break;
+                default:
+                    return res.status(404).json({ error: 'Catalog not found' });
             }
         }
         
         res.json({ metas: results });
     } catch (error) {
-        console.error('Catalog error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch catalog' });
+        console.error('Catalog error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 app.get('/meta/:type/:id', async (req, res) => {
     try {
         const { type, id } = req.params;
+        
+        // Validate type
+        if (!['movie', 'series'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid type' });
+        }
+        
+        // Validate ID format
+        if (!id.startsWith('cineby:')) {
+            return res.status(400).json({ error: 'Invalid ID format' });
+        }
+        
         const cinebyId = id.replace('cineby:', '');
         const mediaType = type === 'series' ? 'tv' : 'movie';
         
@@ -317,15 +382,15 @@ app.get('/meta/:type/:id', async (req, res) => {
         const meta = {
             id: id,
             type: type,
-            name: details.title || details.name,
-            poster: details.poster,
-            background: details.image,
-            description: details.description,
-            releaseInfo: details.release_date || details.first_air_date,
+            name: details.title || details.name || 'Unknown Title',
+            poster: details.poster || details.poster_path,
+            background: details.image || details.backdrop_path,
+            description: details.description || details.overview || '',
+            releaseInfo: details.release_date || details.first_air_date || '',
             imdbRating: details.rating ? details.rating.toString() : null,
             genres: client.mapGenreIds(details.genre_ids || []),
             runtime: details.runtime,
-            language: details.original_language
+            language: details.original_language || 'en'
         };
         
         // For series, add episodes information
@@ -333,17 +398,19 @@ app.get('/meta/:type/:id', async (req, res) => {
             meta.videos = [];
             
             for (const season of details.seasons) {
-                if (season.episodes) {
+                if (season.episodes && Array.isArray(season.episodes)) {
                     for (const episode of season.episodes) {
-                        meta.videos.push({
-                            id: `${id}:${season.season_number}:${episode.episode_number}`,
-                            title: `S${season.season_number.toString().padStart(2, '0')}E${episode.episode_number.toString().padStart(2, '0')} - ${episode.name}`,
-                            season: season.season_number,
-                            episode: episode.episode_number,
-                            overview: episode.overview,
-                            thumbnail: episode.still_path,
-                            released: new Date(episode.air_date)
-                        });
+                        if (episode.episode_number && episode.name) {
+                            meta.videos.push({
+                                id: `${id}:${season.season_number}:${episode.episode_number}`,
+                                title: `S${season.season_number.toString().padStart(2, '0')}E${episode.episode_number.toString().padStart(2, '0')} - ${episode.name}`,
+                                season: season.season_number,
+                                episode: episode.episode_number,
+                                overview: episode.overview || '',
+                                thumbnail: episode.still_path,
+                                released: episode.air_date ? new Date(episode.air_date) : undefined
+                            });
+                        }
                     }
                 }
             }
@@ -351,16 +418,32 @@ app.get('/meta/:type/:id', async (req, res) => {
         
         res.json({ meta });
     } catch (error) {
-        console.error('Meta error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch metadata' });
+        console.error('Meta error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 app.get('/stream/:type/:id', async (req, res) => {
     try {
         const { type, id } = req.params;
-        const [, cinebyId, season, episode] = id.split(':');
+        
+        // Validate type
+        if (!['movie', 'series'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid type' });
+        }
+        
+        const idParts = id.split(':');
+        if (idParts.length < 2) {
+            return res.status(400).json({ error: 'Invalid ID format' });
+        }
+        
+        const [, cinebyId, season, episode] = idParts;
         const mediaType = type === 'series' ? 'tv' : 'movie';
+        
+        // For series, validate season and episode
+        if (type === 'series' && (!season || !episode)) {
+            return res.status(400).json({ error: 'Season and episode required for series' });
+        }
         
         const streamData = await client.getStreamSources(
             cinebyId, 
@@ -369,17 +452,19 @@ app.get('/stream/:type/:id', async (req, res) => {
             episode
         );
         
-        if (!streamData || !streamData.sources) {
+        if (!streamData || !streamData.sources || !Array.isArray(streamData.sources)) {
             return res.json({ streams: [] });
         }
         
-        const streams = streamData.sources.map((source, index) => ({
-            url: source.url,
-            title: `${source.quality || 'Auto'} - Server ${index + 1}`,
-            behaviorHints: {
-                notWebReady: source.type !== 'mp4'
-            }
-        }));
+        const streams = streamData.sources
+            .filter(source => source && source.url)
+            .map((source, index) => ({
+                url: source.url,
+                title: `${source.quality || 'Auto'} - Server ${index + 1}`,
+                behaviorHints: {
+                    notWebReady: source.type !== 'mp4'
+                }
+            }));
         
         // Sort by quality preference
         streams.sort((a, b) => {
@@ -391,20 +476,54 @@ app.get('/stream/:type/:id', async (req, res) => {
         
         res.json({ streams });
     } catch (error) {
-        console.error('Stream error:', error.message);
-        res.status(500).json({ error: 'Failed to fetch streams' });
+        console.error('Stream error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        version: manifest.version
+    });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Error handler
+app.use((error, req, res, next) => {
+    console.error('Unhandled error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully');
+    process.exit(0);
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Cineby Stremio Addon running on port ${PORT}`);
-    console.log(`Manifest available at: http://localhost:${PORT}/manifest.json`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Cineby Stremio Addon running on port ${PORT}`);
+    console.log(`📋 Manifest available at: http://localhost:${PORT}/manifest.json`);
+    console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+});
+
+// Handle server errors
+server.on('error', (error) => {
+    console.error('Server error:', error);
+    process.exit(1);
 });
 
 module.exports = app;
